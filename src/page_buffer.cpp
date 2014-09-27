@@ -120,14 +120,18 @@ page_buffer::page_buffer(memory_lock m) :
 page_buffer::~page_buffer() { }
 
 size_t page_buffer::read(size_t n, size_t offset, void *buffer) const {
-    size_t base = round_down_to_page(offset);
 
     // Shrink request to what we can handle.
     n = offset < buffer_size_ ? std::min(n, buffer_size_ - offset) : 0;
 
     size_t position = 0;
-    for (auto it = page_allocations_.lower_bound(base);
+    for (auto it = page_allocations_.begin();
             it != page_allocations_.end() && it->first < n + offset; ++it) {
+
+        if (it->first + it->second.size() < offset) {
+            continue;
+        }
+
         if (it->first > position + offset) {
             // Zerofill gap.
             size_t zero_length = it->first - position - offset;
@@ -212,9 +216,16 @@ ssize_t page_buffer::splice(int fd, unsigned int flags) {
 
     // Build up contiguous iov's and flush them to fd.
     size_t position = 0;
-    page_allocation_map_t::const_iterator it;
-    for (it = page_allocations_.begin();
-            position < last_whole_page && it != page_allocations_.end(); ) {
+
+    bool data_written = false;
+    size_t allocation_remaining = 0;
+
+    page_allocation_map_t::const_iterator it = page_allocations_.begin();
+    if (it != page_allocations_.end()) {
+        allocation_remaining = it->second.size();
+    }
+    for (; position < last_whole_page && it != page_allocations_.end(); ) {
+
         // Fill in gap, if present.
         if (position < it->first) {
             size_t gap_length = it->first - position;
@@ -246,6 +257,12 @@ ssize_t page_buffer::splice(int fd, unsigned int flags) {
             v.iov_len = internal_size;
             ios.push_back(v);
 
+            // Current allocation will be written after this while loop (for up
+            // to internal_size bytes). Subtract what will be written to keep
+            // track how many more bytes the current allocation will have
+            // aftewards.
+            allocation_remaining -= internal_size;
+
             // Advance
             position += internal_size;
             if (position == last_whole_page) {
@@ -253,10 +270,12 @@ ssize_t page_buffer::splice(int fd, unsigned int flags) {
                 break;
             }
             ++it;
+            allocation_remaining = it->second.size();
         }
 
         assert(!(ios.empty()));
         ssize_t ret = vmsplice(fd, &ios[0], ios.size(), flags);
+        data_written = true;
         if (ret == -1) {
             return ret;
         }
@@ -276,17 +295,26 @@ ssize_t page_buffer::splice(int fd, unsigned int flags) {
 
     // If anything remains, write it normally.
     if (last_whole_page < buffer_size_) {
+
+        // Determine whether the remaining data is in current allocation or the
+        // next one.
+        if (data_written && allocation_remaining == 0) {
+            it++;
+            allocation_remaining = it->second.size();
+        }
         assert(it != page_allocations_.end());
         assert(it->first <= last_whole_page);
 
-        size_t internal_offset = last_whole_page - it->first;
-        assert(internal_offset + buffer_size_ - last_whole_page <
-            it->second.size());
+        size_t size_remaining = buffer_size_ - last_whole_page;
+        assert(size_remaining < it->second.size());
+        
+        size_t allocation_offset = it->second.size() - allocation_remaining;
 
         ::write(fd,
-            static_cast<const uint8_t*>(it->second.ptr()) + internal_offset,
-            buffer_size_ - last_whole_page);
-        position += buffer_size_ - last_whole_page;
+            static_cast<const uint8_t*>(it->second.ptr()) + allocation_offset,
+            size_remaining);
+
+        position += size_remaining;
     }
 
     return static_cast<ssize_t>(position);

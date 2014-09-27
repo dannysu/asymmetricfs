@@ -129,6 +129,41 @@ TEST_F(PageBufferTest, Overread) {
     EXPECT_EQ(expected, tmp);
 }
 
+TEST_F(PageBufferTest, ReadSingleAllocation) {
+    const size_t length = 5000;
+
+    const std::string content = make_data(length);
+    buffer.write(content.size(), 0, &content[0]);
+
+    const int offset = 4096;
+    const int n = length - offset;
+    std::string tmp(n, '\1');
+
+    void* ptr = &tmp[0];
+    size_t bytes_read = buffer.read(n, offset, ptr);
+
+    EXPECT_EQ(n, bytes_read);
+    EXPECT_EQ(content.substr(offset), tmp);
+}
+
+TEST_F(PageBufferTest, ReadMiddleAllocation) {
+    const std::string page1 = make_data(4096);
+    buffer.write(page1.size(), 0, &page1[0]);
+
+    const std::string page2 = make_data(4096);
+    buffer.write(page2.size(), 4096, &page2[0]);
+
+    const size_t offset = 5000;
+    const size_t length = 2 * 4096 - offset;
+    std::string tmp(length, '\1');
+
+    void* ptr = &tmp[0];
+    size_t bytes_read = buffer.read(length, offset, ptr);
+
+    EXPECT_EQ(length, bytes_read);
+    EXPECT_EQ(page2.substr(offset - 4096), tmp);
+}
+
 static char mapping(size_t offset) {
     return static_cast<char>(offset);
 }
@@ -236,6 +271,38 @@ TEST_P(PageBufferSpliceTest, ContiguousStart) {
     const std::string data = make_data(GetParam());
 
     buffer.write(data.size(), 0, &data[0]);
+    EXPECT_EQ(data.size(), buffer.size());
+
+    ssize_t ret = buffer.splice(loop.write(), 0);
+    EXPECT_EQ(data.size(), ret);
+    loop.close_writer();
+
+    // Read data of the pipe and verify the contents.
+    std::string tmp(data.size(), '\0');
+    ssize_t read_bytes = read(loop.read(), &tmp[0], tmp.size());
+    EXPECT_EQ(data.size(), read_bytes);
+    EXPECT_EQ(data, tmp);
+
+    // Check EOF.
+    EXPECT_TRUE(loop.eof());
+}
+
+TEST_P(PageBufferSpliceTest, MultiplePages) {
+    const std::string data = make_data(GetParam());
+
+    int num_pages = data.size() / 4096;
+
+    int offset = 0;
+    for (int i = 0; i < num_pages; i++) {
+        buffer.write(4096, offset, &data[0]);
+        offset += 4096;
+    }
+
+    size_t size_remaining = data.size() - offset;
+    if (size_remaining > 0) {
+        buffer.write(size_remaining, offset, &data[0]);
+    }
+
     EXPECT_EQ(data.size(), buffer.size());
 
     ssize_t ret = buffer.splice(loop.write(), 0);
